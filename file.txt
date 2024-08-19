@@ -1,173 +1,62 @@
+
+import org.bouncycastle.bcpg.ArmoredOutputStream;
+import org.bouncycastle.bcpg.SSHAgentPublicKey;
 import org.bouncycastle.openpgp.*;
-import org.bouncycastle.openpgp.operator.jcajce.*;
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
-import org.springframework.stereotype.Component;
+import org.bouncycastle.openpgp.operator.jcajce.JcaPGPKeyPair;
+import org.bouncycastle.openpgp.operator.jcajce.JcaPGPDigestCalculatorProviderBuilder;
+import org.bouncycastle.openpgp.operator.jcajce.JcaPGPKeyPair;
+import org.bouncycastle.openpgp.operator.jcajce.JcePBESecretKeyEncryptorBuilder;
+import org.bouncycastle.openpgp.operator.jcajce.JcePublicKeyKeyEncryptionMethodGenerator;
+import org.bouncycastle.openpgp.operator.jcajce.JcePublicKeyDataDecryptorFactoryBuilder;
+import org.bouncycastle.openpgp.operator.jcajce.JcePublicKeyKeyEncryptionMethodGenerator;
 
-import javax.annotation.PostConstruct;
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.security.KeyFactory;
+import java.security.PublicKey;
 import java.security.Security;
-import java.util.Iterator;
-import java.util.Optional;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Date;
 
-@Component
-public class PgpEncryptionComponent {
+public class SshToPgpConverter {
 
-    @PostConstruct
-    public void init() {
-        Security.addProvider(new BouncyCastleProvider());
-    }
+    public static void main(String[] args) throws Exception {
+        // Wstaw swój klucz SSH-RSA tutaj
+        String sshRsaKey = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC3meYEdZRt+jPSKPjLfRHEHvEUVSOPZf...";
+        
+        Security.addProvider(new org.bouncycastle.jce.provider.BouncyCastleProvider());
+        
+        // Konwersja klucza SSH-RSA na PublicKey
+        PublicKey publicKey = convertSshRsaToPublicKey(sshRsaKey);
 
-    public void encryptFile(File outputFile, File inputFile, File publicKeyFile) throws IOException, PGPException {
-        try (OutputStream out = new BufferedOutputStream(new FileOutputStream(outputFile))) {
-            PGPPublicKey publicKey = readPublicKey(new FileInputStream(publicKeyFile));
-
-            PGPEncryptedDataGenerator encGen = new PGPEncryptedDataGenerator(
-                    new JcePGPDataEncryptorBuilder(PGPEncryptedData.CAST5)
-                            .setWithIntegrityPacket(true)
-                            .setSecureRandom(new java.security.SecureRandom())
-                            .setProvider("BC")
-            );
-
-            encGen.addMethod(new JcePublicKeyKeyEncryptionMethodGenerator(publicKey).setProvider("BC"));
-
-            try (OutputStream encryptedOut = encGen.open(out, new byte[4096])) {
-                try (InputStream fileIn = new BufferedInputStream(new FileInputStream(inputFile))) {
-                    fileIn.transferTo(encryptedOut); // Stream API
-                }
-            }
+        // Tworzenie klucza PGP na podstawie klucza publicznego
+        PGPPublicKey pgpPublicKey = createPgpPublicKey(publicKey);
+        
+        // Zapis klucza PGP do pliku
+        try (FileOutputStream fos = new FileOutputStream("pgpPublicKey.asc");
+             ArmoredOutputStream aos = new ArmoredOutputStream(fos)) {
+            pgpPublicKey.encode(aos);
         }
+        
+        System.out.println("Public PGP key successfully created and saved to pgpPublicKey.asc");
     }
 
-    public void decryptFile(File inputFile, File outputFile, File privateKeyFile, char[] passphrase) throws IOException, PGPException {
-        try (InputStream in = PGPUtil.getDecoderStream(new BufferedInputStream(new FileInputStream(inputFile)))) {
-            PGPObjectFactory pgpF = new PGPObjectFactory(in, new JcaKeyFingerprintCalculator());
-            PGPEncryptedDataList enc = (PGPEncryptedDataList) StreamSupport.stream(((Iterable<Object>) pgpF::nextObject).spliterator(), false)
-                    .filter(PGPEncryptedDataList.class::isInstance)
-                    .findFirst()
-                    .orElseThrow(() -> new PGPException("Encrypted data list not found."));
+    public static PublicKey convertSshRsaToPublicKey(String sshRsaKey) throws Exception {
+        String[] parts = sshRsaKey.split(" ");
+        byte[] keyBytes = java.util.Base64.getDecoder().decode(parts[1]);
 
-            Optional<PGPPublicKeyEncryptedData> pbeOpt = StreamSupport.stream(enc.getEncryptedDataObjects().spliterator(), false)
-                    .map(PGPPublicKeyEncryptedData.class::cast)
-                    .filter(pbe -> {
-                        try {
-                            return findSecretKey(new FileInputStream(privateKeyFile), pbe.getKeyID(), passphrase) != null;
-                        } catch (IOException | PGPException e) {
-                            e.printStackTrace();
-                            return false;
-                        }
-                    })
-                    .findFirst();
-
-            PGPPublicKeyEncryptedData pbe = pbeOpt.orElseThrow(() -> new IllegalArgumentException("Secret key for message not found."));
-            PGPPrivateKey sKey = findSecretKey(new FileInputStream(privateKeyFile), pbe.getKeyID(), passphrase);
-
-            try (InputStream clear = pbe.getDataStream(new JcePublicKeyDataDecryptorFactoryBuilder().setProvider("BC").build(sKey))) {
-                PGPObjectFactory plainFact = new PGPObjectFactory(clear, new JcaKeyFingerprintCalculator());
-                Object message = plainFact.nextObject();
-
-                if (message instanceof PGPCompressedData) {
-                    PGPCompressedData cData = (PGPCompressedData) message;
-                    plainFact = new PGPObjectFactory(cData.getDataStream(), new JcaKeyFingerprintCalculator());
-                    message = plainFact.nextObject();
-                }
-
-                if (message instanceof PGPLiteralData) {
-                    PGPLiteralData ld = (PGPLiteralData) message;
-                    try (InputStream unc = ld.getInputStream(); OutputStream fOut = new BufferedOutputStream(new FileOutputStream(outputFile))) {
-                        unc.transferTo(fOut); // Stream API
-                    }
-                } else {
-                    throw new PGPException("Message is not a simple encrypted file.");
-                }
-
-                if (pbe.isIntegrityProtected() && !pbe.verify()) {
-                    throw new PGPException("Message failed integrity check");
-                }
-            }
-        }
+        X509EncodedKeySpec spec = new X509EncodedKeySpec(keyBytes);
+        KeyFactory kf = KeyFactory.getInstance("RSA");
+        return kf.generatePublic(spec);
     }
 
-    private PGPPrivateKey findSecretKey(InputStream keyIn, long keyID, char[] passphrase) throws IOException, PGPException {
-        PGPSecretKeyRingCollection pgpSec = new PGPSecretKeyRingCollection(PGPUtil.getDecoderStream(keyIn), new JcaKeyFingerprintCalculator());
-
-        return StreamSupport.stream(pgpSec.getKeyRings().spliterator(), false)
-                .flatMap(keyRing -> StreamSupport.stream(keyRing.getSecretKeys().spliterator(), false))
-                .filter(key -> key.getKeyID() == keyID)
-                .findFirst()
-                .map(key -> {
-                    try {
-                        return key.extractPrivateKey(new JcePBESecretKeyDecryptorBuilder().setProvider("BC").build(passphrase));
-                    } catch (PGPException e) {
-                        e.printStackTrace();
-                        return null;
-                    }
-                })
-                .orElse(null);
-    }
-
-    private PGPPublicKey readPublicKey(InputStream in) throws IOException, PGPException {
-        PGPPublicKeyRingCollection pgpPub = new PGPPublicKeyRingCollection(PGPUtil.getDecoderStream(in), new JcaKeyFingerprintCalculator());
-
-        return StreamSupport.stream(pgpPub.getKeyRings().spliterator(), false)
-                .flatMap(keyRing -> StreamSupport.stream(keyRing.getPublicKeys().spliterator(), false))
-                .filter(PGPPublicKey::isEncryptionKey)
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Can't find encryption key in key ring."));
+    public static PGPPublicKey createPgpPublicKey(PublicKey publicKey) throws Exception {
+        Date now = new Date();
+        JcaPGPKeyPair pgpKeyPair = new JcaPGPKeyPair(PGPPublicKey.RSA_GENERAL, publicKey, now);
+        
+        return new PGPPublicKey(pgpKeyPair.getPublicKey());
     }
 }
-
-
-
------BEGIN PGP PUBLIC KEY BLOCK-----
-
-mQENBGDdHeEBCADJjPzDA6ZLDcfE34qi1QfJ15uxC/6pq/Q7/HgFUmZnsTLODSkI
-j4n4w/T3gkRfgRsCff+yaXu4kpo2pG5rc6yGgqAeSxwFIVCG1Ekc71EfxuoOq7eV
-cfA4yQpBTVKKzDZ6a4BOhNm3ypEBPipM0+5GQv/wd86a9WxdOl9P99bTQilZgGZJ
-meMY/4r+xGyHFhgRhD5o77h6gN7MAUtDDE2bd2K7y6nOmfGRp5rnlt9VdrL7ZRXA
-d+FtfwY6TxEqaCXBV/CLyofpT+yUsKczmfkU2fX4l8DiO+NT2tBWTbRItxE6mTcM
-AXzpoHkUncJduGO8Up9T39kK9prZW2TLtOW1ABEBAAG0H3Rlc3QgdGVzdGVyIDx0
-ZXN0QGV4YW1wbGUuY29tPokBVAQTAQoAPhYhBOKtwdyigR9WcZoZUsvPKmcddmMg
-BQJg3R3hAhsDBQkDw7UEBQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJECvPKmcE
-ddmM9hwH/jRBi7/MJ0ZQs/bi1Jm6B5jDZPaCG4ZcZfjrw6rSjtSMW5z5VzzLxBYe
-aIZay9TRlHEeGUMpa3kXj1znrGZhwIJmpOfDpoo5RYdQJuoa4ONVG2gCVs0OltqG
-yjeA4XuvQ3AEf6hwnjXMnJ2MpfUQHTpg0J5mPR2qPglTxyA/BdX5h5HCmbi8+xg8
-2mX5Jh15JH5Vw7czri4f1lRCX4MKsHyH5ix/c1a5Q6ns8rR9Ygb+J+juf3sMddal
-knKDAZLPjV4ubZalDScx7DBcByXeNTAj5/cMshwRCDh+K+z2p3hJAfZ8ieOQLse1
-5UvnGPksHRXugMihzv9hDLgyWvG0W++5AQ0EYN0d4EBCAC62E4/s0Ay+FnP3Ts8c
-RVNcU2uUeOTVs2Pmhc5abexvX7EALj1VkQXwCJViJpyGb2M8GMLkKOnmo5uzsvcl
-k6DOJ4eBeUs4RjB8biJZMS4GkQmiT7IEhFcpcZQYld5yAoF9C8kAHd2fjOnbczH7
-jXcAYLVO8PShxYfh+rfpsdWhe5rJYtX3zQqfKhLKEUv5CVtkMzflNvg8gl2FJIzK
-B2kztCCpOj00qRL0f7H58p54FA7oqCgC28RVIXL2P0AY79nng9XjScD4DQZpZzIc
-50MV6ddtFT+HZESMTIN07eQkl4zoFzfjOdr79r5KZxeQwVqMLzM5f7uxt5auLVJD
-d+Re7tp2P5i0Fq5hbXZ2lo/5ABEBAAGJAR8EGAEIAAkFAYDdHeECCgkQK88qZwR1
-2YxAawf/fQuZ5RUfnpMTdUoq1kGxErpAcG0aN/b7WlYvRmFIC/GXGbLkLXmbPMp3
-fa2xqNUbo/Bu2GsH+JzOTuJ6fS8SP9I14CPRXyDYUhg8DKVzTuCm2uWZjp5NxOMr
-vTAkDB9RixM7RsX2ZxMh1ULkHZMyFwBhoH1bwZlIYiwlLGwa7HOaFlz3bMtI/9Nf
-0ViSTK1gggAw6Lq5Z0iQQYipL3ev90d1yfXEXuy6FhhpUVrsBrMJh6CnNVrz5rNr
-EOqKh5ZnKBy0H9WWbKhxfUZcfGbR5zrUt4nR6g1FTXHTuq+SoVsKPU6iKwUsfj1E
-S3TYHdW2Ubb1eCkPXNkU30h4N4Zt
-=15JS
------END PGP PUBLIC KEY BLOCK-----
-
-
-
------BEGIN PGP PRIVATE KEY BLOCK-----
-
-lQOYBGDdHeEBCADJjPzDA6ZLDcfE34qi1QfJ15uxC/6pq/Q7/HgFUmZnsTLODSkI
-j4n4w/T3gkRfgRsCff+yaXu4kpo2pG5rc6yGgqAeSxwFIVCG1Ekc71EfxuoOq7eV
-cfA4yQpBTVKKzDZ6a4BOhNm3ypEBPipM0+5GQv/wd86a9WxdOl9P99bTQilZgGZJ
-meMY/4r+xGyHFhgRhD5o77h6gN7MAUtDDE2bd2K7y6nOmfGRp5rnlt9VdrL7ZRXA
-d+FtfwY6TxEqaCXBV/CLyofpT+yUsKczmfkU2fX4l8DiO+NT2tBWTbRItxE6mTcM
-AXzpoHkUncJduGO8Up9T39kK9prZW2TLtOW1ABEBAAEAB/4mt3xOK0J8cJz6hOpd
-thXeO8pPQO6+ZUm8vZ/vzNo0smGTjFzRBL6yhnws10GVHs63HyS52plX5ehRVVpy
-S0oBSmiE2t7oJDa7FdR3CxzvYcRGfHCIGDSdRtzwTq5h6ZSVu+RS7m2Ivcp/HTQm
-h6CB4YeCWnNN8LPVhlF/rth7p1qxVXTHKk8ApkSVL8n5NFWftK4+6/whzokYNcnk
-/Z5kLco48z3+IkG6idEVhZh/mMvCCG4q82mRL9NgrxTBWk2GJzMAF+rryzQgqHV8
-mGiFvnn3xI3IPmZbC4hFEa+dDZtoAC4RPsbq+9DylI6sjxYqCEaDMIKgWS7rEsy1
-JdoCnN2LBADuYNo60lZHCoRMBG/sAMckIcdKt5Rbxyq8rpEu5hBUyTpeGhgVfuQj
-WPHFOfs5N1+br3fzqqHDDnbYVfr91RTpkf+Z79u4t2Cbte46UUBK8Mmt8WpoZ1HD
-Mvn36cvazBffXL7DfT24AzJP1EYjArdKeqMhPZ1DhBBh+tdXaKoRUkkBAP0ZBIpu
-sy8QU9q6Yjp1aJinRygkrLntdMsbfBa6OUHhl8EvwA8sIl99IE0dsKg3ztllAVtv
-RmY8h1ztM93Dsf6jr10OSaJfdmDKojWrTd7g5xYlcmw8InAFlja8M2P61WtKiU1J
-Af6KGggHCyPEsVnDC4fNx6gAkLv3Or5+pq2GVboIw1r
 
