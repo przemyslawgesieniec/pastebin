@@ -1,0 +1,117 @@
+import org.bouncycastle.openpgp.*;
+import org.bouncycastle.openpgp.operator.jcajce.*;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import java.io.*;
+import java.security.Security;
+import java.util.Iterator;
+import java.util.Optional;
+
+@Component
+public class PgpEncryptionComponent {
+
+    @PostConstruct
+    public void init() {
+        Security.addProvider(new BouncyCastleProvider());
+    }
+
+    public void encryptFile(File outputFile, File inputFile, File publicKeyFile) throws IOException, PGPException {
+        try (OutputStream out = new BufferedOutputStream(new FileOutputStream(outputFile))) {
+            PGPPublicKey publicKey = readPublicKey(new FileInputStream(publicKeyFile));
+
+            PGPEncryptedDataGenerator encGen = new PGPEncryptedDataGenerator(
+                    new JcePGPDataEncryptorBuilder(PGPEncryptedData.CAST5)
+                            .setWithIntegrityPacket(true)
+                            .setSecureRandom(new java.security.SecureRandom())
+                            .setProvider("BC")
+            );
+
+            encGen.addMethod(new JcePublicKeyKeyEncryptionMethodGenerator(publicKey).setProvider("BC"));
+
+            try (OutputStream encryptedOut = encGen.open(out, new byte[4096])) {
+                try (InputStream fileIn = new BufferedInputStream(new FileInputStream(inputFile))) {
+                    fileIn.transferTo(encryptedOut); // Stream API
+                }
+            }
+        }
+    }
+
+    public void decryptFile(File inputFile, File outputFile, File privateKeyFile, char[] passphrase) throws IOException, PGPException {
+        try (InputStream in = PGPUtil.getDecoderStream(new BufferedInputStream(new FileInputStream(inputFile)))) {
+            PGPObjectFactory pgpF = new PGPObjectFactory(in, new JcaKeyFingerprintCalculator());
+            PGPEncryptedDataList enc = (PGPEncryptedDataList) StreamSupport.stream(((Iterable<Object>) pgpF::nextObject).spliterator(), false)
+                    .filter(PGPEncryptedDataList.class::isInstance)
+                    .findFirst()
+                    .orElseThrow(() -> new PGPException("Encrypted data list not found."));
+
+            Optional<PGPPublicKeyEncryptedData> pbeOpt = StreamSupport.stream(enc.getEncryptedDataObjects().spliterator(), false)
+                    .map(PGPPublicKeyEncryptedData.class::cast)
+                    .filter(pbe -> {
+                        try {
+                            return findSecretKey(new FileInputStream(privateKeyFile), pbe.getKeyID(), passphrase) != null;
+                        } catch (IOException | PGPException e) {
+                            e.printStackTrace();
+                            return false;
+                        }
+                    })
+                    .findFirst();
+
+            PGPPublicKeyEncryptedData pbe = pbeOpt.orElseThrow(() -> new IllegalArgumentException("Secret key for message not found."));
+            PGPPrivateKey sKey = findSecretKey(new FileInputStream(privateKeyFile), pbe.getKeyID(), passphrase);
+
+            try (InputStream clear = pbe.getDataStream(new JcePublicKeyDataDecryptorFactoryBuilder().setProvider("BC").build(sKey))) {
+                PGPObjectFactory plainFact = new PGPObjectFactory(clear, new JcaKeyFingerprintCalculator());
+                Object message = plainFact.nextObject();
+
+                if (message instanceof PGPCompressedData) {
+                    PGPCompressedData cData = (PGPCompressedData) message;
+                    plainFact = new PGPObjectFactory(cData.getDataStream(), new JcaKeyFingerprintCalculator());
+                    message = plainFact.nextObject();
+                }
+
+                if (message instanceof PGPLiteralData) {
+                    PGPLiteralData ld = (PGPLiteralData) message;
+                    try (InputStream unc = ld.getInputStream(); OutputStream fOut = new BufferedOutputStream(new FileOutputStream(outputFile))) {
+                        unc.transferTo(fOut); // Stream API
+                    }
+                } else {
+                    throw new PGPException("Message is not a simple encrypted file.");
+                }
+
+                if (pbe.isIntegrityProtected() && !pbe.verify()) {
+                    throw new PGPException("Message failed integrity check");
+                }
+            }
+        }
+    }
+
+    private PGPPrivateKey findSecretKey(InputStream keyIn, long keyID, char[] passphrase) throws IOException, PGPException {
+        PGPSecretKeyRingCollection pgpSec = new PGPSecretKeyRingCollection(PGPUtil.getDecoderStream(keyIn), new JcaKeyFingerprintCalculator());
+
+        return StreamSupport.stream(pgpSec.getKeyRings().spliterator(), false)
+                .flatMap(keyRing -> StreamSupport.stream(keyRing.getSecretKeys().spliterator(), false))
+                .filter(key -> key.getKeyID() == keyID)
+                .findFirst()
+                .map(key -> {
+                    try {
+                        return key.extractPrivateKey(new JcePBESecretKeyDecryptorBuilder().setProvider("BC").build(passphrase));
+                    } catch (PGPException e) {
+                        e.printStackTrace();
+                        return null;
+                    }
+                })
+                .orElse(null);
+    }
+
+    private PGPPublicKey readPublicKey(InputStream in) throws IOException, PGPException {
+        PGPPublicKeyRingCollection pgpPub = new PGPPublicKeyRingCollection(PGPUtil.getDecoderStream(in), new JcaKeyFingerprintCalculator());
+
+        return StreamSupport.stream(pgpPub.getKeyRings().spliterator(), false)
+                .flatMap(keyRing -> StreamSupport.stream(keyRing.getPublicKeys().spliterator(), false))
+                .filter(PGPPublicKey::isEncryptionKey)
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Can't find encryption key in key ring."));
+    }
+}
